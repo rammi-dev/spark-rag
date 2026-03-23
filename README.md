@@ -94,7 +94,7 @@ Runs on a local K8s cluster (minikube, 3 Hyper-V nodes) managed by the [playgrou
 ```
 src/spark_rag/
   config.py            — config.yaml + env vars ✓
-  chunking/            — tree-sitter AST (code), beautifulsoup4 (docs/SO/issues)
+  chunking/            — tree-sitter AST (code), Markdown (docs), beautifulsoup4 (SO/issues)
   embedding/client.py  — Ollama nomic-embed-text client with batching ✓
   milvus/              — collection schemas, ingest, search + re-rank
   synthesis/           — swappable LLM provider (claude / noop)
@@ -116,6 +116,16 @@ docs/
 
 - [Architecture](docs/architecture.md) — system design, ingestion flows, query pipeline, deployment topology
 - [Milvus Collections](docs/milvus-collections.md) — schemas, indexes, example queries, lifecycle
+
+## Future: Lance Cold Storage
+
+Optional optimization: add [Lance](https://lancedb.github.io/lance/) as a cold storage layer between ingestion and Milvus. Embeddings are the bottleneck (~2-4h per version on CPU Ollama). Lance persists embeddings so Milvus can be rebuilt in minutes without re-embedding. Also enables offline analysis with DuckDB and index config experiments.
+
+```
+Ingest → chunk → embed → Lance (cold) → load → Milvus (hot)
+```
+
+Uses `lance` library (columnar format only, no DB server). Stored on Ceph S3. Not implemented yet — deferred until re-ingestion cost justifies it. See [architecture.md](docs/architecture.md#future-lance-cold-storage-layer) for details.
 
 ## Phase 2: LlamaIndex Migration
 

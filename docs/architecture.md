@@ -282,15 +282,17 @@ SynthesisProvider (ABC)
 
 Metadata: `file_path`, `language`, `chunk_type`, `qualified_name`, `signature`, `spark_apis` (JSON), `problem_indicators` (JSON).
 
-### Docs (beautifulsoup4 — HTML from spark.apache.org)
+### Docs (Markdown from repo `docs/`)
+
+Source: `docs/*.md` from the apache/spark git repo (same clone as code ingestion). Markdown files with inline HTML tables (config refs) and Jekyll `{% include_example %}` tags.
 
 | Chunk Type | Split Strategy |
 |---|---|
-| prose section | Split on heading boundaries, keep heading hierarchy |
-| code example | Separate chunk, linked to parent section |
-| config table | Separate chunk, key-value pairs |
+| prose section | Split on Markdown heading boundaries (`#`, `##`, `###`), keep heading hierarchy |
+| code example | Fenced code blocks + resolved `{% include_example %}` refs from `examples/src/main/` |
+| config table | Inline HTML `<table>` elements (config reference pages) |
 
-Metadata: `doc_url`, `doc_section`, `heading_hierarchy`, `content_type`, `related_configs`.
+Metadata: `doc_url` (file path in repo), `doc_section`, `heading_hierarchy`, `content_type`, `related_configs`.
 
 ### StackOverflow (API JSON + beautifulsoup4)
 
@@ -314,3 +316,51 @@ All states: open + closed. Comments included.
 
 Metadata: `issue_number`, `state`, `labels`, `author`, `is_comment`, `parent_issue_number`, `created_at`, `closed_at`, `spark_versions_mentioned`, `linked_prs`.
 
+---
+
+## Future: Lance Cold Storage Layer
+
+Currently, Milvus (backed by Ceph S3) is the only vector store. If re-ingestion time becomes painful (~6-8h for a full rebuild due to CPU-only embedding), a **Lance cold storage layer** can be added:
+
+```
+Ingest → chunk → embed → Lance (cold, all data, persistent)
+                              ↓ selective load (minutes)
+                         Milvus (hot, serving queries)
+```
+
+### Why Lance (not raw Parquet on S3)
+
+| Feature | Parquet on S3 | Lance on S3 |
+|---|---|---|
+| Vector storage | Serialized blobs | Native fixed-size-list columns, random access |
+| Updates | Immutable (rewrite whole file) | Append + update individual records |
+| Filtering | Full scan or partition pruning | Predicate pushdown on scalar + vector columns |
+| Versioning | Manual (file naming) | Built-in dataset versioning (rollback support) |
+| Read into Milvus | Deserialize + batch insert | Direct row iteration → batch insert |
+
+### When to add it
+
+- Embedding is the bottleneck (CPU Ollama, ~2-4h per Spark version)
+- Lance stores embeddings once; reloading to Milvus takes minutes instead of re-embedding
+- Useful for: Milvus index config experiments (drop + reload), offline analysis with DuckDB, disaster recovery
+
+### How it would work
+
+- `lance` Python library (not `lancedb` — no DB server needed, just the columnar format)
+- Lance datasets stored on Ceph S3 at `s3://spark-rag-lance/{collection}/`
+- Each collection maps to a Lance dataset with matching schema
+- Ingestion writes to Lance first, then loads to Milvus
+- CLI command: `uv run python -m spark_rag.lance.load --collection spark_code --version 4.1.0`
+
+Not implemented yet — deferred until re-ingestion cost justifies it.
+
+## Future: Additional Data Sources
+
+| Source | Value | Priority |
+|---|---|---|
+| **Apache JIRA (SPARK-*)** | Historical issues 2014-2024 (~40K), bulk of Spark's bug/feature history pre-GitHub migration | High — more history than GitHub Issues |
+| **Spark CHANGES.md / release notes** | Dense version-specific changelog, what changed and why | Medium — already in repo, easy to add |
+| **Spark migration guides** | Version comparison gold (already in `docs/`, prioritized during ingestion) | Medium — covered by docs ingestion |
+| **HuggingFace code datasets (CodeParrot, Conala)** | General code, not Spark-specific. Low signal-to-noise. | Low — Spark source code is the best Spark code dataset |
+| **CodeSearchNet** | General code corpus, minimal Spark coverage | Low — not worth filtering effort |
+| **GitHub repos with PySpark code (BigCode/The Stack)** | Real-world usage patterns, but licensing concerns and quality varies | Phase 2 — consider after core sources are solid |

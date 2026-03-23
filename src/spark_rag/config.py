@@ -57,7 +57,9 @@ class SparkCodeIngestion:
 
 @dataclass
 class SparkDocsIngestion:
-    base_url: str = "https://spark.apache.org/docs/"
+    paths: list[str] = field(default_factory=lambda: ["docs/"])
+    examples_path: str = "examples/src/main/"
+    glob: str = "*.md"
 
 
 @dataclass
@@ -157,7 +159,9 @@ def load_config(path: Path | str | None = None) -> Config:
                 paths=ingestion_raw.get("spark_code", {}).get("paths", ["sql/", "core/", "mllib/", "python/pyspark/"]),
             ) if "spark_code" in ingestion_raw else SparkCodeIngestion(),
             spark_docs=SparkDocsIngestion(
-                base_url=ingestion_raw.get("spark_docs", {}).get("base_url", SparkDocsIngestion.base_url),
+                paths=ingestion_raw.get("spark_docs", {}).get("paths", ["docs/"]),
+                examples_path=ingestion_raw.get("spark_docs", {}).get("examples_path", "examples/src/main/"),
+                glob=ingestion_raw.get("spark_docs", {}).get("glob", "*.md"),
             ) if "spark_docs" in ingestion_raw else SparkDocsIngestion(),
             stackoverflow=StackOverflowIngestion(
                 tags=ingestion_raw.get("stackoverflow", {}).get("tags", ["apache-spark"]),

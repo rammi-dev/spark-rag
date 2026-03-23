@@ -34,7 +34,9 @@ def config_file(tmp_path):
             repo_url: "https://github.com/apache/spark.git"
             paths: ["sql/", "core/"]
           spark_docs:
-            base_url: "https://spark.apache.org/docs/"
+            paths: ["docs/"]
+            examples_path: "examples/src/main/"
+            glob: "*.md"
           stackoverflow:
             tags: ["apache-spark"]
             filter: "answered"
