@@ -13,7 +13,7 @@ synthesis:
   model: "claude-sonnet-4-20250514"
 
 # Spark versions to index
-# Each version is ingested separately; all chunks tagged with spark_version metadata
+# Code + docs are ingested per version; all chunks tagged with spark_version metadata
 # Queries can filter by version or search across all
 spark_versions:
   baseline: "4.1.0"                       # default version for queries
@@ -23,13 +23,32 @@ spark_versions:
     - tag: "v3.5.4"
       version: "3.5.4"
 
-# Ingestion sources
+# Ingestion sources — 4 data sources, 4 Milvus collections
 ingestion:
-  spark_repo:
-    url: "https://github.com/apache/spark.git"
+  # 1. Spark source code (per version)
+  #    Collection: spark_code
+  spark_code:
+    repo_url: "https://github.com/apache/spark.git"
     paths: ["sql/", "core/", "mllib/", "python/pyspark/"]
+
+  # 2. Spark documentation (per version)
+  #    Collection: spark_docs
   spark_docs:
     base_url: "https://spark.apache.org/docs/"   # appended with {version}/
+
+  # 3. StackOverflow — general Spark questions, answered only
+  #    Collection: spark_stackoverflow
+  #    Cross-version (spark_version extracted from content when detectable)
   stackoverflow:
-    tags: ["apache-spark;out-of-memory", "apache-spark;performance", "apache-spark;memory-leak"]
-    max_questions: 2000
+    tags: ["apache-spark"]
+    filter: "answered"                    # only posts with accepted or scored answers
+    max_questions: 5000
+
+  # 4. GitHub Issues — apache/spark, all states (open + closed)
+  #    Collection: spark_issues
+  #    Cross-version (milestone/labels may indicate version)
+  github_issues:
+    repo: "apache/spark"
+    state: "all"                          # open + closed
+    include_comments: true                # ingest issue comments too
+    max_issues: 10000
