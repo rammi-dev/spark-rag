@@ -74,16 +74,32 @@ def _html_table_to_text(html: str) -> str:
 
 
 def _split_text(text: str) -> list[str]:
-    """Split text exceeding MAX_CHUNK_CHARS on paragraph boundaries."""
+    """Split text exceeding MAX_CHUNK_CHARS.
+
+    First tries splitting on paragraph boundaries (double newline).
+    If a single paragraph is still too long, splits on single newlines (table rows).
+    """
     if len(text) <= MAX_CHUNK_CHARS:
         return [text]
 
-    parts: list[str] = []
+    # First pass: split on double newlines
     paragraphs = text.split("\n\n")
+    parts: list[str] = []
     current: list[str] = []
     current_len = 0
 
     for para in paragraphs:
+        # If a single paragraph exceeds limit, split it on single newlines
+        if len(para) > MAX_CHUNK_CHARS:
+            # Flush current
+            if current:
+                parts.append("\n\n".join(current))
+                current = []
+                current_len = 0
+            # Split the oversized paragraph on newlines
+            parts.extend(_split_lines(para))
+            continue
+
         if current_len + len(para) > MAX_CHUNK_CHARS and current:
             parts.append("\n\n".join(current))
             current = []
@@ -93,6 +109,27 @@ def _split_text(text: str) -> list[str]:
 
     if current:
         parts.append("\n\n".join(current))
+
+    return parts
+
+
+def _split_lines(text: str) -> list[str]:
+    """Split on single newlines when paragraph-level split isn't enough."""
+    lines = text.split("\n")
+    parts: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for line in lines:
+        if current_len + len(line) > MAX_CHUNK_CHARS and current:
+            parts.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += len(line) + 1
+
+    if current:
+        parts.append("\n".join(current))
 
     return parts
 
@@ -207,14 +244,15 @@ def chunk_markdown(
                 lang, code = code_blocks[idx]
                 if code:
                     configs = _extract_configs(code)
-                    chunks.append(DocChunk(
-                        content=code,
-                        doc_url=file_path,
-                        doc_section=section_name,
-                        heading_hierarchy=list(heading_stack),
-                        content_type="code_example",
-                        related_configs={"configs": configs},
-                    ))
+                    for part in _split_text(code):
+                        chunks.append(DocChunk(
+                            content=part,
+                            doc_url=file_path,
+                            doc_section=section_name,
+                            heading_hierarchy=list(heading_stack),
+                            content_type="code_example",
+                            related_configs={"configs": configs},
+                        ))
                 continue
 
             # HTML table placeholder
@@ -225,14 +263,15 @@ def chunk_markdown(
                 table_text = _html_table_to_text(html_tables[idx])
                 if table_text.strip():
                     configs = _extract_configs(table_text)
-                    chunks.append(DocChunk(
-                        content=table_text,
-                        doc_url=file_path,
-                        doc_section=section_name,
-                        heading_hierarchy=list(heading_stack),
-                        content_type="config_table",
-                        related_configs={"configs": configs},
-                    ))
+                    for part in _split_text(table_text):
+                        chunks.append(DocChunk(
+                            content=part,
+                            doc_url=file_path,
+                            doc_section=section_name,
+                            heading_hierarchy=list(heading_stack),
+                            content_type="config_table",
+                            related_configs={"configs": configs},
+                        ))
                 continue
 
             prose_lines.append(line)

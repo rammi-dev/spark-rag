@@ -5,8 +5,8 @@ This file provides guidance to Claude Code when working with code in this reposi
 ## Project Overview
 
 RAG-based Spark expert system. Indexes 4 knowledge sources to build a comprehensive Spark knowledge base:
-- **Spark source code** — multi-version (4.1, 3.5, etc.), AST-parsed
-- **Spark documentation** — multi-version, structured by sections
+- **Spark source code** — multi-version (4.1, 3.5, etc.), AST-parsed via tree-sitter
+- **Spark documentation** — multi-version, Markdown from repo `docs/*.md`
 - **StackOverflow** — general Spark questions, answered posts only
 - **GitHub Issues** — apache/spark repo, all issues (open + closed) with comments
 
@@ -22,11 +22,11 @@ Two modes: retrieval-only (default, no API key needed) and retrieval + Claude sy
 
 Runs on the K8s cluster managed by `/mnt/c/Work/playground`.
 
-### Required components
-- **Milvus** (`milvus` ns) — vector store (4 collections: spark_code, spark_docs, spark_stackoverflow, spark_issues)
-- **Ollama** (`ollama` ns) — embedding model (nomic-embed-text, 768 dims)
-- **Airflow** (`airflow` ns) — orchestrates ingestion DAGs (4 DAGs)
-- **Ceph** (`rook-ceph` ns) — S3 for raw data bucket + Milvus storage backend
+### Required components (all deployed and validated)
+- **Milvus** (`milvus` ns) — v2.6.8 cluster, 4 collections, HNSW/COSINE, 768d vectors
+- **Ollama** (`ollama` ns) — nomic-embed-text (768 dims), CPU-only
+- **Airflow** (`airflow` ns) — 3.1.8, CeleryExecutor, 2 workers, KubernetesPodOperator RBAC
+- **Ceph** (`rook-ceph` ns) — S3 gateway + block storage + CephFS
 
 To activate missing components:
 ```bash
@@ -45,9 +45,9 @@ uv run uvicorn spark_rag.api.main:app --reload
 ANTHROPIC_API_KEY=sk-... uv run uvicorn spark_rag.api.main:app --reload
 
 # Run tests
-uv run pytest                              # all tests
+uv run pytest                              # all tests (162 unit + 21 integration + 20 infra)
 uv run pytest tests/unit/                  # unit only (no infra needed)
-uv run pytest tests/infra/                 # Milvus + Airflow validation
+uv run pytest tests/infra/                 # Milvus + Airflow + Ollama validation
 uv run pytest tests/integration/           # needs Ollama + Milvus port-forwarded
 ```
 
@@ -59,41 +59,74 @@ kubectl -n ollama port-forward svc/ollama 11434:11434 &
 kubectl -n airflow port-forward svc/airflow-api-server 8080:8080 &
 ```
 
-## Project Structure
+### Ingestion
+```bash
+# One-time: code + docs per version
+uv run python -m spark_rag.ingestion.code --version 4.1.0
+uv run python -m spark_rag.ingestion.docs --version 4.1.0
+
+# Incremental: SO + issues (or let Airflow handle)
+uv run python -m spark_rag.ingestion.stackoverflow
+uv run python -m spark_rag.ingestion.issues --token $GITHUB_TOKEN
+
+# Dry run (chunk + count, no embedding)
+uv run python -m spark_rag.ingestion.code --version 4.1.0 --dry-run
+```
+
+## Module Architecture
 
 ```
-src/spark_rag/
-  config.py          — load config.yaml + env vars
-  chunking/          — tree-sitter AST (code), beautifulsoup4 (docs/SO/issues)
-  embedding/         — Ollama nomic-embed-text client
-  milvus/            — collection schemas, ingest, search + re-rank
-  synthesis/         — swappable LLM provider (claude/noop)
-  ingestion/         — GitHub clone, docs scrape, SO API, GitHub Issues API
-  api/               — FastAPI service + query pipeline
-airflow/dags/        — 4 ingestion DAGs (KubernetesPodOperator)
-deployments/         — K8s manifests for API service
-config.yaml          — project config (endpoints, synthesis toggle, versions, sources)
+config.py → loads config.yaml + env overrides
+
+chunking/
+  spark_patterns.py → API detection (30+ patterns), problem rules (11), error extraction
+  code_chunker.py   → tree-sitter AST → method/class_summary/imports chunks
+  doc_chunker.py    → Markdown headings/code blocks/HTML tables → prose/code_example/config_table
+  so_chunker.py     → SO API JSON → question + answer chunks
+  issue_chunker.py  → GitHub API → issue body + comment chunks
+
+embedding/client.py → Ollama HTTP client, batching, health check
+
+milvus/
+  collections.py → 4 schemas (spark_code, spark_docs, spark_stackoverflow, spark_issues)
+  ingest.py      → batch insert, version replace, incremental dedup
+  search.py      → multi-collection parallel search, re-ranking (similarity × weight + boosts)
+
+synthesis/
+  base.py   → SynthesisProvider ABC
+  noop.py   → returns None (retrieval-only)
+  claude.py → builds structured prompt → Claude API → written analysis
+
+ingestion/
+  github.py         → git clone/checkout (sparse, blob-filter)
+  code.py           → CLI: repo → tree-sitter chunk → embed → Milvus
+  docs.py           → CLI: repo docs/*.md → Markdown chunk → embed → Milvus
+  stackoverflow.py  → CLI: StackExchange API → chunk → embed → incremental Milvus
+  issues.py         → CLI: GitHub API → chunk → embed → incremental Milvus
+
+api/
+  main.py     → FastAPI (POST /analyze, GET /health), lifespan startup
+  analyzer.py → query pipeline: detect type → parse → embed → search → rerank → synthesize
 ```
 
 ## 4 Milvus Collections
 
 | Collection | Source | Version-tagged | Key metadata |
 |---|---|---|---|
-| spark_code | GitHub apache/spark source | Yes (per ingested version) | file_path, language, chunk_type, qualified_name, spark_apis |
-| spark_docs | spark.apache.org/docs | Yes (per ingested version) | doc_url, doc_section, heading_hierarchy, content_type |
-| spark_stackoverflow | StackOverflow API | Cross-version (extracted when detectable) | question_id, score, is_accepted, tags, error_type |
-| spark_issues | GitHub Issues API | Cross-version (labels/milestone) | issue_number, state, labels, author, is_comment, created_at |
+| spark_code | GitHub apache/spark source | Yes (per version) | file_path, language (partition key), chunk_type, qualified_name, spark_apis |
+| spark_docs | `docs/*.md` from repo | Yes (per version) | doc_url, doc_section, heading_hierarchy, content_type, related_configs |
+| spark_stackoverflow | StackExchange API | Cross-version | question_id, score, is_accepted, tags, error_type, spark_versions_mentioned |
+| spark_issues | GitHub Issues API | Cross-version | issue_number, state, labels, author, is_comment, spark_versions_mentioned, linked_prs |
 
 ## Key Design Decisions
-- Code + docs have `spark_version` field — ingested per version, queryable by version
-- SO + Issues are cross-version — `spark_version` extracted from content/labels when detectable
-- Queries accept optional `version` filter; default is baseline (4.1.0)
-- Ingestion DAGs accept version parameter for code/docs; SO/issues ingest everything
-- tree-sitter for code chunking (Scala/Java/Python AST), beautifulsoup4 for docs/SO/issues
-- GitHub Issues include comments (each comment = separate chunk linked to parent issue)
-- SO filtered to answered posts only (has accepted answer or answer score > 0)
+- Code + docs ingested per version via CLI scripts (not Airflow — overkill for one-time)
+- SO + Issues synced incrementally via Airflow DAGs (or CLI with `--since`)
+- Docs sourced from repo Markdown (not website scrape) — includes inline HTML config tables + Jekyll include_example resolution
+- tree-sitter for code chunking (Scala/Java/Python), Markdown parsing for docs, beautifulsoup4 for SO/issues
+- Re-ranking: vector similarity × collection weight (varies by input type) + API overlap + SO score + accepted answer + closed issue + version mention boosts
+- Synthesis prompt includes: user input + detected patterns + top 15 context chunks with source metadata
 
 ## Airflow Notes
-- DAGs PVC is mounted on the **dag-processor** pod, not the scheduler
-- Deploy DAGs via: `kubectl cp` to the dag-processor pod's `/opt/airflow/dags/`
+- DAGs PVC mounted on **dag-processor** pod, not the scheduler
+- Deploy DAGs via dag-processor: `kubectl exec -n airflow <dag-processor-pod> -c dag-processor -- ...`
 - Airflow 3.x API uses JWT auth: `POST /auth/token` with admin:admin
