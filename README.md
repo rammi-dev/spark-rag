@@ -69,19 +69,44 @@ Runs on a local K8s cluster (minikube, 3 Hyper-V nodes) managed by the [playgrou
 | Airflow | `airflow` | Deployed, validated | Periodic ingestion — SO + GitHub Issues incremental sync |
 | Ceph | `rook-ceph` | Deployed (base infra) | S3 storage — raw scraped data + Milvus backend |
 
+## Implementation Status
+
+| Module | Status | Tests |
+|---|---|---|
+| `config.py` | Done | 12 unit tests |
+| `embedding/client.py` | Done | 8 unit + 5 integration |
+| `milvus/collections.py` | Pending | — |
+| `chunking/` | Pending | — |
+| `milvus/search.py` | Pending | — |
+| `synthesis/` | Pending | — |
+| `ingestion/` | Pending | — |
+| `api/` | Pending | — |
+| Airflow DAGs | Pending | — |
+
+### Phase 0 Validation (complete)
+
+- Milvus v2.6.8: all features validated (HNSW/COSINE, 768d vectors, JSON fields, partition keys, filtered search, batch insert, multi-collection parallel search) — 10 tests
+- Airflow 3.1.8: API, scheduler, workers, DAG processor, DAGs PVC, RBAC for KubernetesPodOperator, DAG deployment — 10 tests
+- Ollama: nomic-embed-text deployed, 768d embeddings verified, similarity checks pass — 5 integration tests
+
 ## Project Structure
 
 ```
 src/spark_rag/
-  config.py            — config.yaml + env vars
+  config.py            — config.yaml + env vars ✓
   chunking/            — tree-sitter AST (code), beautifulsoup4 (docs/SO/issues)
-  embedding/           — Ollama nomic-embed-text client
+  embedding/client.py  — Ollama nomic-embed-text client with batching ✓
   milvus/              — collection schemas, ingest, search + re-rank
   synthesis/           — swappable LLM provider (claude / noop)
   ingestion/           — CLI scripts (code, docs) + modules for SO, issues
   api/                 — FastAPI service + query pipeline
 airflow/dags/          — 2 Airflow DAGs (SO + issues incremental sync)
 deployments/           — K8s manifests
+tests/
+  infra/               — Milvus + Airflow validation (Phase 0) ✓
+  unit/                — Unit tests (no infra needed) ✓
+  integration/         — Needs Ollama + Milvus port-forwarded ✓
+  e2e/                 — Full pipeline tests
 docs/
   architecture.md      — full architecture with Mermaid diagrams
   milvus-collections.md — collection schemas + example queries
