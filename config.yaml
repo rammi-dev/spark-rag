@@ -1,0 +1,35 @@
+# Infrastructure endpoints (from playground K8s cluster)
+ollama:
+  url: "http://localhost:11434"           # port-forwarded, or ollama.ollama.svc:11434 in-cluster
+  embedding_model: "nomic-embed-text"
+
+milvus:
+  url: "http://localhost:19530"           # port-forwarded, or milvus.milvus.svc:19530 in-cluster
+
+# LLM synthesis (off by default)
+synthesis:
+  enabled: false                          # set true + ANTHROPIC_API_KEY to enable
+  provider: "claude"
+  model: "claude-sonnet-4-20250514"
+
+# Spark versions to index
+# Each version is ingested separately; all chunks tagged with spark_version metadata
+# Queries can filter by version or search across all
+spark_versions:
+  baseline: "4.1.0"                       # default version for queries
+  available:
+    - tag: "v4.1.0"
+      version: "4.1.0"
+    - tag: "v3.5.4"
+      version: "3.5.4"
+
+# Ingestion sources
+ingestion:
+  spark_repo:
+    url: "https://github.com/apache/spark.git"
+    paths: ["sql/", "core/", "mllib/", "python/pyspark/"]
+  spark_docs:
+    base_url: "https://spark.apache.org/docs/"   # appended with {version}/
+  stackoverflow:
+    tags: ["apache-spark;out-of-memory", "apache-spark;performance", "apache-spark;memory-leak"]
+    max_questions: 2000
