@@ -226,12 +226,30 @@ graph TB
     Pods --> RGW
 ```
 
+## Infrastructure Status
+
+All infrastructure components are deployed and validated on the 3-node minikube cluster.
+
+| Component | Version | Namespace | Validated |
+|---|---|---|---|
+| Milvus | v2.6.8 (cluster mode) | `milvus` | HNSW/COSINE index, 768d vectors, JSON fields, partition keys, filtered search, batch insert >100/s, multi-collection parallel search |
+| Ollama | latest + nomic-embed-text | `ollama` | 768-dim embeddings, batch API, health check, CPU-only (4Gi limit) |
+| Airflow | 3.1.8 (CeleryExecutor) | `airflow` | JWT API auth, DAG processor + CephFS PVC, 2 Celery workers, KubernetesPodOperator RBAC (create pods + read logs) |
+| Ceph | Rook v1.19.1 / Ceph v20 | `rook-ceph` | S3 gateway, block storage, CephFS — base infra, always running |
+
+### Key Findings from Validation
+
+- **Airflow DAGs PVC**: mounted on the **dag-processor** pod, NOT the scheduler. Deploy DAGs via dag-processor.
+- **Airflow API auth**: Airflow 3.x uses JWT — `POST /auth/token` with admin:admin to get bearer token.
+- **Milvus insert latency**: data not immediately searchable after insert — need ~2s flush time before search returns results.
+- **Ollama nomic-embed-text**: cosine similarity for semantically similar Spark texts is ~0.5-0.65, not >0.9. Thresholds adjusted accordingly.
+
 ## Resource Estimates
 
 | Resource | Usage |
 |---|---|
 | Milvus vector data | ~500MB total across 4 collections (HNSW overhead included) |
-| Ollama model storage | +274MB for nomic-embed-text |
+| Ollama model storage | +274MB for nomic-embed-text (20Gi PVC, plenty of room) |
 | FastAPI pod | 500m CPU, 1Gi RAM |
 | Ingestion pods (ephemeral) | 1 CPU, 2Gi RAM each |
 | Ceph S3 raw data | ~5GB (source + docs HTML + SO JSON + issues JSON) |
