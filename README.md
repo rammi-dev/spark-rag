@@ -14,7 +14,7 @@ RAG-based Spark expert system. Ask questions about Apache Spark — get answers 
 | Source | What's Indexed | Update Strategy |
 |---|---|---|
 | **Spark source code** | `sql/`, `core/`, `mllib/`, `python/pyspark/` — AST-parsed into methods, classes, imports | One-time CLI per version |
-| **Spark documentation** | spark.apache.org/docs — prose, code examples, config tables | One-time CLI per version |
+| **Spark documentation** | `docs/*.md` from repo — guides, config tables, code examples (Jekyll include_example resolved) | One-time CLI per version |
 | **StackOverflow** | `apache-spark` tag, answered posts only — questions + answers | Airflow weekly incremental |
 | **GitHub Issues** | apache/spark, all states (open + closed) + comments | Airflow daily incremental |
 
@@ -75,17 +75,29 @@ Runs on a local K8s cluster (minikube, 3 Hyper-V nodes) managed by the [playgrou
 |---|---|---|
 | `config.py` | Done | 12 unit tests |
 | `embedding/client.py` | Done | 8 unit + 5 integration |
-| `milvus/collections.py` | Pending | — |
-| `chunking/` | Pending | — |
-| `milvus/search.py` | Pending | — |
-| `synthesis/` | Pending | — |
-| `ingestion/` | Pending | — |
-| `api/` | Pending | — |
+| `milvus/collections.py` | Done | 14 unit + 11 integration |
+| `milvus/ingest.py` | Done | 4 unit |
+| `milvus/search.py` | Done | 14 unit |
+| `chunking/spark_patterns.py` | Done | 29 unit |
+| `chunking/code_chunker.py` | Done | 19 unit |
+| `chunking/doc_chunker.py` | Done | 12 unit |
+| `chunking/so_chunker.py` | Done | 12 unit |
+| `chunking/issue_chunker.py` | Done | 16 unit |
+| `synthesis/` | Done | 12 unit |
+| `api/analyzer.py` | Done | 10 unit |
+| `api/main.py` | Done | — |
+| `ingestion/code.py` | Done | — (CLI) |
+| `ingestion/docs.py` | Done | — (CLI) |
+| `ingestion/stackoverflow.py` | Done | — (CLI) |
+| `ingestion/issues.py` | Done | — (CLI) |
 | Airflow DAGs | Pending | — |
+| K8s deployments | Pending | — |
+
+**Total: 162 unit tests + 21 integration tests + 20 infra validation tests**
 
 ### Phase 0 Validation (complete)
 
-- Milvus v2.6.8: all features validated (HNSW/COSINE, 768d vectors, JSON fields, partition keys, filtered search, batch insert, multi-collection parallel search) — 10 tests
+- Milvus v2.6.8: HNSW/COSINE, 768d vectors, JSON fields, partition keys, filtered search, batch insert, multi-collection parallel search — 10 tests
 - Airflow 3.1.8: API, scheduler, workers, DAG processor, DAGs PVC, RBAC for KubernetesPodOperator, DAG deployment — 10 tests
 - Ollama: nomic-embed-text deployed, 768d embeddings verified, similarity checks pass — 5 integration tests
 
@@ -93,23 +105,42 @@ Runs on a local K8s cluster (minikube, 3 Hyper-V nodes) managed by the [playgrou
 
 ```
 src/spark_rag/
-  config.py            — config.yaml + env vars ✓
-  chunking/            — tree-sitter AST (code), Markdown (docs), beautifulsoup4 (SO/issues)
-  embedding/client.py  — Ollama nomic-embed-text client with batching ✓
-  milvus/              — collection schemas, ingest, search + re-rank
-  synthesis/           — swappable LLM provider (claude / noop)
-  ingestion/           — CLI scripts (code, docs) + modules for SO, issues
-  api/                 — FastAPI service + query pipeline
-airflow/dags/          — 2 Airflow DAGs (SO + issues incremental sync)
-deployments/           — K8s manifests
+  config.py              — config.yaml + env vars ✓
+  chunking/
+    spark_patterns.py    — Spark API detection + problem patterns + error extraction ✓
+    code_chunker.py      — tree-sitter AST chunking (Scala/Java/Python) ✓
+    doc_chunker.py       — Markdown docs chunking (headings, code blocks, HTML tables) ✓
+    so_chunker.py        — StackOverflow Q&A chunking ✓
+    issue_chunker.py     — GitHub Issues + comments chunking ✓
+  embedding/
+    client.py            — Ollama nomic-embed-text client with batching ✓
+  milvus/
+    collections.py       — 4 collection schemas + lifecycle ✓
+    ingest.py            — batch insert, version replace, incremental dedup ✓
+    search.py            — multi-collection search + re-ranking ✓
+  synthesis/
+    base.py              — SynthesisProvider ABC ✓
+    noop.py              — no-op (retrieval-only mode) ✓
+    claude.py            — Claude API synthesis ✓
+  ingestion/
+    github.py            — git clone/checkout helpers ✓
+    code.py              — CLI: ingest Spark source code ✓
+    docs.py              — CLI: ingest Spark docs (Markdown) ✓
+    stackoverflow.py     — CLI: ingest SO Q&A (StackExchange API) ✓
+    issues.py            — CLI: ingest GitHub issues (GitHub API) ✓
+  api/
+    main.py              — FastAPI app (POST /analyze, GET /health) ✓
+    analyzer.py          — query pipeline (detect → parse → embed → search → rerank → synthesize) ✓
+airflow/dags/            — 2 Airflow DAGs (SO + issues periodic sync) — pending
+deployments/             — K8s manifests — pending
 tests/
-  infra/               — Milvus + Airflow validation (Phase 0) ✓
-  unit/                — Unit tests (no infra needed) ✓
-  integration/         — Needs Ollama + Milvus port-forwarded ✓
-  e2e/                 — Full pipeline tests
+  infra/                 — Milvus + Airflow + Ollama validation (Phase 0) ✓
+  unit/                  — 162 unit tests ✓
+  integration/           — 21 integration tests (Milvus CRUD + Ollama embedding) ✓
+  e2e/                   — Full pipeline tests — pending
 docs/
-  architecture.md      — full architecture with Mermaid diagrams
-  milvus-collections.md — collection schemas + example queries
+  architecture.md        — system design, ingestion flows, query pipeline, deployment
+  milvus-collections.md  — collection schemas + example queries
 ```
 
 ## Docs
