@@ -62,12 +62,12 @@ curl localhost:8000/analyze -d '{"input": "Why does my Spark job OOM on groupByK
 
 Runs on a local K8s cluster (minikube, 3 Hyper-V nodes) managed by the [playground](file:///mnt/c/Work/playground) repo.
 
-| Component | Namespace | Role |
-|---|---|---|
-| Milvus | `milvus` | Vector store — 4 collections, HNSW index, COSINE metric |
-| Ollama | `ollama` | Embedding model — nomic-embed-text (768 dims) |
-| Airflow | `airflow` | Periodic ingestion — SO + GitHub Issues incremental sync |
-| Ceph | `rook-ceph` | S3 storage — raw scraped data + Milvus backend |
+| Component | Namespace | Status | Role |
+|---|---|---|---|
+| Milvus | `milvus` | Deployed, validated | Vector store — v2.6.8 cluster, 4 collections, HNSW/COSINE |
+| Ollama | `ollama` | Deployed, validated | Embedding — nomic-embed-text (768d), CPU-only |
+| Airflow | `airflow` | Deployed, validated | Periodic ingestion — SO + GitHub Issues incremental sync |
+| Ceph | `rook-ceph` | Deployed (base infra) | S3 storage — raw scraped data + Milvus backend |
 
 ## Project Structure
 
