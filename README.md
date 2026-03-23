@@ -51,11 +51,43 @@ kubectl -n ollama port-forward svc/ollama 11434:11434 &
 uv run python -m spark_rag.ingestion.docs --version 4.1.0
 uv run python -m spark_rag.ingestion.code --version 4.1.0
 
+# Incremental sources (or let Airflow handle these)
+uv run python -m spark_rag.ingestion.stackoverflow
+uv run python -m spark_rag.ingestion.issues --token $GITHUB_TOKEN
+
 # Run API
 uv run uvicorn spark_rag.api.main:app --reload
 
 # Query
-curl localhost:8000/analyze -d '{"input": "Why does my Spark job OOM on groupByKey?"}'
+curl -X POST localhost:8000/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Why does my Spark job OOM on groupByKey?"}'
+
+# Health check
+curl localhost:8000/health
+```
+
+### Ingestion Commands
+
+```bash
+# One-time: Spark source code (per version, ~2-4h on CPU)
+uv run python -m spark_rag.ingestion.code --version 4.1.0
+uv run python -m spark_rag.ingestion.code --version 3.5.4
+
+# One-time: Spark docs (per version, ~5 min)
+uv run python -m spark_rag.ingestion.docs --version 4.1.0
+
+# Incremental: StackOverflow (all answered Spark questions)
+uv run python -m spark_rag.ingestion.stackoverflow
+uv run python -m spark_rag.ingestion.stackoverflow --since 2025-01-01  # incremental
+
+# Incremental: GitHub Issues (all open + closed + comments)
+uv run python -m spark_rag.ingestion.issues --token $GITHUB_TOKEN
+uv run python -m spark_rag.ingestion.issues --since 2025-01-01        # incremental
+
+# Dry run: chunk + count without embedding (fast, for testing)
+uv run python -m spark_rag.ingestion.code --version 4.1.0 --dry-run
+uv run python -m spark_rag.ingestion.docs --version 4.1.0 --dry-run
 ```
 
 ## Infrastructure
