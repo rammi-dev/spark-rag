@@ -161,6 +161,9 @@ class TestInsertAndSearch:
         res = client.insert(collection_name=self.COLL_NAME, data=data)
         assert res["insert_count"] == 100
 
+        # Flush to make data searchable
+        time.sleep(2)
+
         # Search
         query_vec = _random_vectors(1)
         results = client.search(
@@ -395,6 +398,9 @@ class TestMultiCollectionSearch:
                 for vec in vectors
             ]
             client.insert(collection_name=coll_name, data=data)
+
+        # Wait for all inserts to be searchable
+        time.sleep(2)
 
         # Search all 3
         query_vec = _random_vectors(1)
