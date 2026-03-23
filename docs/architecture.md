@@ -2,398 +2,334 @@
 
 ## System Context
 
-The spark-rag system sits between a user (data engineer) and 4 knowledge sources, backed by a K8s infrastructure layer.
+spark-rag is a RAG-based Spark expert. It indexes 4 knowledge sources and serves answers via a FastAPI endpoint.
 
 ```mermaid
 graph LR
-    User[Data Engineer] -->|question / code / logs| API[spark-rag API]
-    API -->|response: patterns + references + analysis| User
+    User[Data Engineer] -->|question / code / logs| API[spark-rag API :8000]
+    API -->|patterns + references + analysis| User
 
-    API -->|embed query| Ollama
-    API -->|vector search| Milvus
+    API -->|embed query| Ollama[Ollama :11434]
+    API -->|vector search| Milvus[Milvus :19530]
     API -->|synthesize when enabled| Claude[Claude API]
-
-    Airflow -->|schedules| Ingestion[Ingestion Pods]
-    Ingestion -->|clone / checkout tag| GitHub[GitHub apache/spark]
-    Ingestion -->|scrape versioned docs| SparkDocs[spark.apache.org]
-    Ingestion -->|fetch answered posts| SO[StackOverflow API]
-    Ingestion -->|fetch all issues| Issues[GitHub Issues API]
-    Ingestion -->|embed chunks| Ollama
-    Ingestion -->|upsert vectors| Milvus
-    Ingestion -->|store raw data| CephS3[Ceph S3]
 ```
 
-## Deployment Topology
+## Ingestion Architecture
 
-Everything runs on a 3-node minikube cluster (Hyper-V). The spark-rag API is the only new deployment; all other services are pre-existing infrastructure components.
+Two ingestion modes with different lifecycle:
 
-```mermaid
-graph TB
-    subgraph K8S["Kubernetes Cluster — minikube 3 nodes (Hyper-V)"]
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ ONE-TIME (CLI scripts, run via uv run)                          │
+│                                                                 │
+│   uv run python -m spark_rag.ingestion.code --version 4.1.0    │
+│   uv run python -m spark_rag.ingestion.docs --version 4.1.0    │
+│                                                                 │
+│ Bulk ingest of Spark source code and docs per version.          │
+│ Run manually when adding a new Spark version.                   │
+│ Re-run to fully replace a version's data.                       │
+└─────────────────────────────────────────────────────────────────┘
 
-        subgraph SparkRAG["spark-rag namespace"]
-            API["FastAPI Service<br/>:8000<br/>analyzer.py"]
-            SP["spark_patterns.py<br/>tree-sitter AST<br/>+ pattern detection"]
-        end
-
-        subgraph Airflow_NS["airflow namespace"]
-            Scheduler["Airflow Scheduler"]
-            DagProc["DAG Processor<br/>(mounts DAGs PVC)"]
-            Workers["Celery Workers (2)"]
-            WebUI["Airflow API Server<br/>:8080"]
-            DAG1["DAG: ingest_spark_code"]
-            DAG2["DAG: ingest_spark_docs"]
-            DAG3["DAG: ingest_stackoverflow"]
-            DAG4["DAG: ingest_github_issues"]
-            Pods["KubernetesPodOperator<br/>Ingestion Pods<br/>(ephemeral)"]
-        end
-
-        subgraph Ollama_NS["ollama namespace"]
-            Ollama["Ollama<br/>:11434<br/>nomic-embed-text (768d)"]
-        end
-
-        subgraph Milvus_NS["milvus namespace"]
-            Proxy["Milvus Proxy<br/>:19530"]
-            QN["QueryNode"]
-            DN["DataNode"]
-            Coord["MixCoordinator"]
-            Attu["Attu Web UI<br/>:3000"]
-            subgraph Collections["4 Collections (HNSW, COSINE)"]
-                C1["spark_code<br/>~50K vectors"]
-                C2["spark_docs<br/>~1K vectors"]
-                C3["spark_stackoverflow<br/>~20K vectors"]
-                C4["spark_issues<br/>~50K vectors"]
-            end
-        end
-
-        subgraph Ceph_NS["rook-ceph namespace"]
-            RGW["Ceph RGW (S3)<br/>:80"]
-            subgraph Buckets["S3 Buckets"]
-                B1["milvus<br/>(vector segments + indexes)"]
-                B2["spark-rag-raw<br/>(scraped source data)"]
-            end
-            Block["ceph-block<br/>StorageClass"]
-        end
-
-        subgraph Mon_NS["monitoring namespace"]
-            Grafana["Grafana<br/>:3000"]
-            Prom["Prometheus"]
-            Loki["Loki"]
-        end
-
-        etcd["etcd<br/>(Milvus metadata)"]
-    end
-
-    %% User flow
-    User[Data Engineer] -->|POST /analyze| API
-    API --> SP
-    API -->|embed query| Ollama
-    API -->|vector search| Proxy
-    API -->|synthesis when enabled| Claude[Claude API]
-    API -->|response| User
-
-    %% Ingestion flow
-    Scheduler --> DAG1 & DAG2 & DAG3 & DAG4
-    DAG1 & DAG2 & DAG3 & DAG4 --> Pods
-    Pods -->|embed chunks| Ollama
-    Pods -->|upsert vectors| Proxy
-    Pods -->|store raw| RGW
-
-    %% Milvus internals
-    Proxy --> QN & DN & Coord
-    DN -->|flush segments| RGW
-    QN -->|load segments| RGW
-    Coord --> etcd
-    etcd -->|PVC| Block
-
-    %% Monitoring
-    Prom -.->|scrape metrics| API & Proxy & Ollama
-    Grafana -.-> Prom & Loki
+┌─────────────────────────────────────────────────────────────────┐
+│ PERIODIC (Airflow DAGs, scheduled)                              │
+│                                                                 │
+│   ingest_stackoverflow — weekly, incremental                    │
+│   ingest_github_issues — daily, incremental                     │
+│                                                                 │
+│ Check for new/updated content. Deduplicate by source ID.        │
+│ Upsert: new items inserted, updated items replaced.             │
+│ Runs as KubernetesPodOperator (ephemeral pods).                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Ingestion Pipeline
-
-4 Airflow DAGs, each following the same pattern: **fetch → chunk → embed → upsert**.
-
-All DAGs use `KubernetesPodOperator` — actual processing runs in ephemeral pods, not in Celery workers. DAGs are deployed to the Airflow DAGs PVC via the dag-processor pod.
+### Ingestion Data Flow
 
 ```mermaid
 flowchart TD
-    subgraph Sources
-        GH["GitHub apache/spark<br/>(git clone, checkout tag)"]
-        SD["spark.apache.org/docs/{version}/"]
-        SO["StackOverflow API<br/>(tag: apache-spark, answered)"]
-        GI["GitHub Issues API<br/>(apache/spark, all states)"]
+    subgraph OneTime["One-Time (CLI)"]
+        GH["GitHub apache/spark<br/>git clone → checkout tag"]
+        SD["spark.apache.org<br/>docs/{version}/"]
+    end
+
+    subgraph Periodic["Periodic (Airflow)"]
+        SO["StackOverflow API<br/>tag: apache-spark<br/>answered only"]
+        GI["GitHub Issues API<br/>apache/spark<br/>all states"]
     end
 
     subgraph Chunking
-        CC["code_chunker.py<br/>tree-sitter AST<br/>(Scala/Java/Python)"]
-        DC["doc_chunker.py<br/>beautifulsoup4<br/>HTML → sections"]
-        SC["so_chunker.py<br/>Q&A splitting<br/>error type extraction"]
-        IC["issue_chunker.py<br/>issue + comments<br/>label/milestone extraction"]
+        CC["code_chunker.py<br/>tree-sitter AST"]
+        DC["doc_chunker.py<br/>beautifulsoup4"]
+        SC["so_chunker.py<br/>Q&A split"]
+        IC["issue_chunker.py<br/>issue + comments"]
     end
 
     subgraph Enrichment
-        SP["spark_patterns.py<br/>API detection<br/>problem pattern matching"]
+        SP["spark_patterns.py<br/>API detection +<br/>problem pattern matching"]
     end
 
-    subgraph Storage
-        OL["Ollama<br/>nomic-embed-text<br/>→ 768-dim vectors"]
-        S3["Ceph S3<br/>spark-rag-raw bucket<br/>(raw scraped data)"]
-        MV[("Milvus<br/>4 collections")]
+    subgraph Store
+        OL["Ollama nomic-embed-text<br/>→ 768-dim vectors"]
+        S3["Ceph S3 spark-rag-raw<br/>(raw scraped data)"]
+        MV[("Milvus — 4 collections")]
     end
 
-    GH --> CC --> SP --> OL --> MV
-    SD --> DC --> OL
-    SO --> SC --> OL
-    GI --> IC --> OL
-
-    GH --> S3
-    SD --> S3
-    SO --> S3
-    GI --> S3
+    GH --> S3 --> CC --> SP --> OL --> MV
+    SD --> S3 --> DC --> OL
+    SO --> S3 --> SC --> OL
+    GI --> S3 --> IC --> OL
 ```
 
-### DAG Schedule
+### One-Time Ingestion (Code + Docs)
 
-| DAG | Source | Version-aware | Schedule | Estimated Duration |
-|---|---|---|---|---|
-| `ingest_spark_code` | GitHub apache/spark source | Yes — accepts `spark_version` param, checks out corresponding git tag | Manual / weekly | ~2-4h per version (embedding bottleneck) |
-| `ingest_spark_docs` | spark.apache.org/docs/{version}/ | Yes — accepts `spark_version` param | Manual / monthly | ~5 min per version |
-| `ingest_stackoverflow` | StackExchange API | No — cross-version, extracts version from content | Monthly | ~30 min |
-| `ingest_github_issues` | GitHub Issues API | No — cross-version, extracts version from labels/milestone | Weekly | ~1-2h (paginated API, includes comments) |
+Plain Python scripts. No orchestration framework needed.
 
-### Version-Aware Ingestion
+```bash
+# Ingest Spark 4.1 source code
+uv run python -m spark_rag.ingestion.code --version 4.1.0
 
-Code and docs DAGs accept a `spark_version` parameter:
+# Ingest Spark 4.1 docs
+uv run python -m spark_rag.ingestion.docs --version 4.1.0
 
-```
-# Trigger for a specific version
-airflow dags trigger ingest_spark_code --conf '{"spark_version": "4.1.0", "git_tag": "v4.1.0"}'
-airflow dags trigger ingest_spark_docs --conf '{"spark_version": "4.1.0"}'
+# Add another version later
+uv run python -m spark_rag.ingestion.code --version 3.5.4
+uv run python -m spark_rag.ingestion.docs --version 3.5.4
 ```
 
-Each chunk is tagged with `spark_version` in Milvus metadata. Re-ingesting a version replaces its chunks (upsert keyed on `spark_version` + `source_id`).
+Re-ingesting a version deletes existing chunks for that version first, then inserts fresh data.
 
-SO and GitHub Issues are cross-version. The chunker attempts to extract version references from content, labels, and milestones — stored as `spark_versions_mentioned` (JSON array) when detectable.
+### Periodic Ingestion (SO + Issues via Airflow)
+
+Airflow DAGs handle incremental sync with deduplication:
+
+| DAG | Schedule | Dedup Strategy |
+|---|---|---|
+| `ingest_stackoverflow` | Weekly | Upsert by `question_id`. Fetch questions modified since last run. Replace if answer score/accepted status changed. |
+| `ingest_github_issues` | Daily | Upsert by `issue_number` + `comment_id`. Fetch issues updated since last run. Replace issue body if edited, add new comments. |
+
+Both DAGs track a **high-water mark** (last sync timestamp) stored in Milvus metadata or a simple state file in Ceph S3. On each run:
+
+1. Fetch items modified after high-water mark
+2. For each item: delete existing vectors with matching source ID → insert new chunks
+3. Update high-water mark
+
+DAGs use `KubernetesPodOperator` — processing runs in ephemeral pods, not Celery workers.
 
 ## Query Pipeline
 
 ```mermaid
 flowchart TD
-    Input["User Input<br/>question / code / error logs"] --> Parse["spark_patterns.py<br/>— If code: AST parse + pattern detection<br/>— If logs: error type extraction<br/>— If question: pass through"]
+    Input["User Input<br/>question / code / error logs"]
 
-    Parse --> Embed["Ollama embed<br/>1-3 queries depending on input type:<br/>• the input text<br/>• extracted error message (if logs)<br/>• synthetic pattern query (if code)"]
+    Input --> Detect["Input type detection<br/>— code: parseable by tree-sitter<br/>— logs: stacktrace / exception / log markers<br/>— question: natural language"]
 
-    Embed --> Search["Milvus search<br/>parallel queries across all 4 collections<br/>with optional version filter"]
+    Detect --> Parse["spark_patterns.py<br/>code → AST parse + pattern detection<br/>logs → error type extraction<br/>question → pass through"]
 
-    Search --> Rerank["Re-ranker<br/>— vector similarity score<br/>— API/keyword overlap<br/>— pattern match boost<br/>— SO score / issue activity<br/>— version relevance"]
+    Parse --> Embed["Ollama embed<br/>1-3 queries depending on input:<br/>• input text<br/>• extracted error (if logs)<br/>• synthetic pattern query (if code)"]
+
+    Embed --> Search["Milvus parallel search<br/>all 4 collections<br/>optional version filter"]
+
+    Search --> Rerank["Re-ranker<br/>• vector similarity<br/>• API/keyword overlap<br/>• pattern match boost<br/>• SO score / issue activity<br/>• version relevance"]
 
     Rerank --> Decision{synthesis<br/>enabled?}
 
-    Decision -->|no| Response1["Return:<br/>detected patterns +<br/>ranked references from<br/>code / docs / SO / issues"]
+    Decision -->|no| R1["Return:<br/>detected patterns<br/>+ ranked references"]
 
-    Decision -->|yes| Claude["Claude API<br/>user input +<br/>detected patterns +<br/>top 15 retrieved chunks"]
+    Decision -->|yes| Claude["Claude API<br/>input + patterns +<br/>top 15 chunks"]
 
-    Claude --> Response2["Return:<br/>detected patterns +<br/>ranked references +<br/>written analysis"]
+    Claude --> R2["Return:<br/>patterns + references<br/>+ written analysis"]
 ```
-
-### Query Modes
-
-**Retrieval-only (default)** — no API key needed:
-1. Parse input (detect if it's code, logs, or a question)
-2. Extract patterns and signals from input
-3. Embed 1-3 queries via Ollama
-4. Search all 4 Milvus collections in parallel (with optional version filter)
-5. Re-rank results combining similarity + metadata signals
-6. Return: detected patterns + ranked references (code snippets, doc sections, SO answers, related issues)
-
-**Retrieval + Claude synthesis** — requires `ANTHROPIC_API_KEY`:
-- Same retrieval steps 1-5
-- Then sends user input + detected patterns + top 15 retrieved chunks to Claude
-- Returns everything from retrieval-only mode, plus a written analysis with root cause and recommendations
 
 ### Input Type Detection
 
-The query pipeline auto-detects input type to optimize search:
-
 | Input Type | Detection Signal | Embedding Strategy | Collection Weights |
 |---|---|---|---|
-| **Code** | Parseable by tree-sitter, contains Spark API calls | Embed code + synthetic pattern query | code: 0.4, docs: 0.3, SO: 0.2, issues: 0.1 |
-| **Error logs** | Contains stacktrace, exception class names, log level markers | Embed error message + full log context | SO: 0.35, issues: 0.3, docs: 0.2, code: 0.15 |
-| **Question** | Natural language, no code structure | Embed question text | docs: 0.35, SO: 0.3, code: 0.2, issues: 0.15 |
+| Code | Parseable by tree-sitter, contains Spark API calls | code + synthetic pattern query | code: 0.4, docs: 0.3, SO: 0.2, issues: 0.1 |
+| Error logs | Stacktrace, exception class, log level markers | error message + full log context | SO: 0.35, issues: 0.3, docs: 0.2, code: 0.15 |
+| Question | Natural language, no code structure | question text | docs: 0.35, SO: 0.3, code: 0.2, issues: 0.15 |
 
 ### Version Filtering
 
-Queries accept an optional `version` parameter:
-- If specified: filter code + docs collections to that version; SO + issues searched across all versions but boost results mentioning the target version
-- If omitted: uses baseline version (4.1.0) for code + docs; SO + issues unfiltered
-- Special value `"all"`: search all versions in code + docs (useful for "when did behavior X change?" questions)
+- `version` param specified → filter code/docs to that version; boost SO/issues mentioning it
+- `version` omitted → uses baseline (4.1.0) for code/docs; SO/issues unfiltered
+- `version: "all"` → search all versions (useful for "when did X change?" questions)
 
-## Chunking Strategies
+### API Response Shape
 
-### Code (tree-sitter AST)
+Same shape in both modes — `analysis` is `null` when synthesis is off:
 
-Parses Scala, Java, and Python using tree-sitter (pure Python/C, no JVM dependency).
+```json
+{
+  "input_type": "code",
+  "detected_patterns": [
+    {"name": "collect_on_large", "risk": "HIGH", "location": "line 12"}
+  ],
+  "references": [
+    {"source": "spark_code", "content": "...", "file_path": "...", "score": 0.92},
+    {"source": "spark_docs", "content": "...", "doc_url": "...", "score": 0.87},
+    {"source": "spark_stackoverflow", "content": "...", "question_id": 123, "score": 0.85},
+    {"source": "spark_issues", "content": "...", "issue_number": 456, "score": 0.80}
+  ],
+  "analysis": null
+}
+```
 
-| Chunk Type | What | Size Target |
-|---|---|---|
-| **method/function** | Full method body | Split at ~512 tokens if too long |
-| **class summary** | Class name + all method signatures | Acts as table of contents |
-| **import block** | All imports per file | One chunk per file |
+## Deployment Topology
 
-Metadata extracted per chunk:
-- `file_path`, `language`, `chunk_type`, `qualified_name`, `signature`
-- `spark_apis` (JSON) — detected Spark API calls (e.g. `["SparkSession.builder", "DataFrame.select"]`)
-- `problem_indicators` (JSON) — detected anti-patterns with risk level
+```mermaid
+graph TB
+    subgraph K8S["Kubernetes — minikube 3 nodes (Hyper-V)"]
 
-### Docs (beautifulsoup4)
+        subgraph SparkRAG["spark-rag namespace"]
+            API["FastAPI :8000"]
+        end
 
-Parses HTML from spark.apache.org/docs/{version}/.
+        subgraph Airflow_NS["airflow namespace"]
+            DagProc["DAG Processor<br/>(mounts DAGs PVC)"]
+            Workers["Celery Workers (2)"]
+            DAG1["ingest_stackoverflow"]
+            DAG2["ingest_github_issues"]
+            Pods["KubernetesPodOperator<br/>ephemeral pods"]
+        end
 
-| Chunk Type | Split Strategy |
-|---|---|
-| **prose section** | Split on heading boundaries, keep heading hierarchy |
-| **code example** | Separate chunk, linked to parent section |
-| **config table** | Separate chunk, structured as key-value pairs |
+        subgraph Ollama_NS["ollama namespace"]
+            Ollama["Ollama :11434<br/>nomic-embed-text"]
+        end
 
-Metadata: `doc_url`, `doc_section`, `heading_hierarchy` (JSON array), `content_type`, `related_configs` (JSON).
+        subgraph Milvus_NS["milvus namespace"]
+            Proxy["Milvus Proxy :19530"]
+            Attu["Attu UI :3000"]
+            C1["spark_code"]
+            C2["spark_docs"]
+            C3["spark_stackoverflow"]
+            C4["spark_issues"]
+        end
 
-### StackOverflow (beautifulsoup4 + API JSON)
+        subgraph Ceph_NS["rook-ceph namespace"]
+            RGW["Ceph RGW S3"]
+            B1["milvus bucket"]
+            B2["spark-rag-raw bucket"]
+        end
 
-| Chunk Type | What |
-|---|---|
-| **question** | Title + body, one chunk |
-| **answer** | Each answer is a separate chunk |
+        subgraph Mon_NS["monitoring namespace"]
+            Grafana["Grafana :3000"]
+            Prom["Prometheus"]
+        end
+    end
 
-Filter: only questions with at least one answer where `is_accepted == true` OR `answer_score > 0`.
+    User[Data Engineer] -->|POST /analyze| API
+    API --> Ollama
+    API --> Proxy
 
-Metadata: `question_id`, `score`, `is_accepted`, `tags` (JSON), `error_type` (extracted from stacktrace if present), `spark_apis_mentioned` (JSON), `spark_versions_mentioned` (JSON).
-
-### GitHub Issues (GitHub API)
-
-| Chunk Type | What |
-|---|---|
-| **issue** | Title + body, one chunk |
-| **comment** | Each comment is a separate chunk, linked to parent issue |
-
-All issues fetched: open + closed. Comments included.
-
-Metadata: `issue_number`, `state` (open/closed), `labels` (JSON), `author`, `is_comment`, `parent_issue_number` (for comments), `created_at`, `closed_at`, `spark_versions_mentioned` (JSON, extracted from labels/milestone), `linked_prs` (JSON).
-
-## 4 Milvus Collections
-
-All collections use **HNSW index** with **COSINE metric** (M=16, efConstruction=256). Embedding dimension: 768 (nomic-embed-text).
-
-### spark_code (~50K vectors per version)
-
-| Field | Type | Description |
-|---|---|---|
-| id | INT64 (PK, auto) | |
-| embedding | FLOAT_VECTOR(768) | nomic-embed-text embedding |
-| content | VARCHAR(65535) | Source code text |
-| spark_version | VARCHAR(32) | e.g. "4.1.0", "3.5.4" |
-| file_path | VARCHAR(512) | Path within repo |
-| language | VARCHAR(32) | scala / java / python (partition key) |
-| chunk_type | VARCHAR(32) | method / class_summary / imports |
-| qualified_name | VARCHAR(512) | e.g. "org.apache.spark.sql.DataFrame.select" |
-| signature | VARCHAR(1024) | Method/function signature |
-| spark_apis | JSON | Detected Spark API calls |
-| problem_indicators | JSON | Anti-patterns with risk levels |
-
-Partition key: `language`
-
-### spark_docs (~1K vectors per version)
-
-| Field | Type | Description |
-|---|---|---|
-| id | INT64 (PK, auto) | |
-| embedding | FLOAT_VECTOR(768) | |
-| content | VARCHAR(65535) | Documentation text |
-| spark_version | VARCHAR(32) | |
-| doc_url | VARCHAR(512) | Source URL |
-| doc_section | VARCHAR(256) | Top-level section name |
-| heading_hierarchy | JSON | `["Configuration", "Spark SQL", "Data Sources"]` |
-| content_type | VARCHAR(32) | prose / code_example / config_table |
-| related_configs | JSON | Referenced config keys |
-
-### spark_stackoverflow (~20K vectors)
-
-| Field | Type | Description |
-|---|---|---|
-| id | INT64 (PK, auto) | |
-| embedding | FLOAT_VECTOR(768) | |
-| content | VARCHAR(65535) | Question or answer text |
-| question_id | INT64 | StackOverflow question ID |
-| is_question | BOOL | true = question chunk, false = answer chunk |
-| score | INT64 | Vote score |
-| is_accepted | BOOL | Accepted answer flag |
-| tags | JSON | `["apache-spark", "pyspark", "out-of-memory"]` |
-| error_type | VARCHAR(256) | Extracted exception class if present |
-| spark_apis_mentioned | JSON | Spark APIs referenced in text |
-| spark_versions_mentioned | JSON | `["3.5", "4.0"]` — extracted from content |
-
-### spark_issues (~50K vectors)
-
-| Field | Type | Description |
-|---|---|---|
-| id | INT64 (PK, auto) | |
-| embedding | FLOAT_VECTOR(768) | |
-| content | VARCHAR(65535) | Issue body or comment text |
-| issue_number | INT64 | GitHub issue number |
-| state | VARCHAR(16) | open / closed |
-| is_comment | BOOL | true = comment, false = issue body |
-| parent_issue_number | INT64 | Same as issue_number for body; links comment to parent |
-| author | VARCHAR(128) | GitHub username |
-| labels | JSON | `["bug", "SQL", "core"]` |
-| created_at | VARCHAR(32) | ISO timestamp |
-| closed_at | VARCHAR(32) | ISO timestamp or empty |
-| spark_versions_mentioned | JSON | Extracted from labels, milestone, content |
-| linked_prs | JSON | Referenced PR numbers |
+    DAG1 & DAG2 --> Pods
+    Pods --> Ollama
+    Pods --> Proxy
+    Pods --> RGW
+```
 
 ## Resource Estimates
 
 | Resource | Usage |
 |---|---|
-| Milvus vector data | ~500MB total across 4 collections (with HNSW overhead), fits in query node's 2Gi |
-| Ollama model storage | +274MB for nomic-embed-text (fits in current 20Gi PVC) |
+| Milvus vector data | ~500MB total across 4 collections (HNSW overhead included) |
+| Ollama model storage | +274MB for nomic-embed-text |
 | FastAPI pod | 500m CPU, 1Gi RAM |
-| Ingestion pods | Ephemeral, 1 CPU / 2Gi RAM each |
-| Ceph S3 raw data | ~5GB total (source code + docs HTML + SO JSON + issues JSON) |
-| Claude API (when enabled) | ~$0.003-0.01 per query (~4K input + ~500 output tokens) |
+| Ingestion pods (ephemeral) | 1 CPU, 2Gi RAM each |
+| Ceph S3 raw data | ~5GB (source + docs HTML + SO JSON + issues JSON) |
+| Claude API (when enabled) | ~$0.003-0.01 per query |
 
 ## Two Operating Modes
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ Retrieval Only (default)                                            │
-│                                                                     │
-│ Input → Parse → Embed → Search 4 collections → Re-rank → Response  │
-│                                                                     │
-│ No API key needed. Returns:                                         │
-│ • Detected patterns/signals                                         │
-│ • Ranked references (code, docs, SO, issues)                        │
-│ • analysis: null                                                    │
-├─────────────────────────────────────────────────────────────────────┤
-│ Retrieval + Claude Synthesis                                        │
-│                                                                     │
-│ Same pipeline + top 15 chunks sent to Claude API                    │
-│                                                                     │
-│ Requires: ANTHROPIC_API_KEY + synthesis.enabled: true               │
-│ Returns:                                                            │
-│ • Everything above                                                  │
-│ • analysis: written explanation with root cause + recommendations   │
-└─────────────────────────────────────────────────────────────────────┘
-```
+| Mode | Config | What you get |
+|---|---|---|
+| **Retrieval only** (default) | `synthesis.enabled: false` | Detected patterns + ranked references from all 4 collections |
+| **Retrieval + synthesis** | `synthesis.enabled: true` + `ANTHROPIC_API_KEY` | Same + written analysis from Claude with root cause and recommendations |
 
-The API response shape is identical in both modes — the `analysis` field is `null` when synthesis is off.
-
-## Synthesis Module (Swappable)
+Synthesis module is swappable:
 
 ```
 SynthesisProvider (ABC)
-├── NoopSynthesis    — returns None (retrieval-only mode)
-└── ClaudeSynthesis  — sends structured prompt to Claude API
+├── NoopSynthesis    → returns None (retrieval-only)
+└── ClaudeSynthesis  → Claude API (anthropic SDK)
 ```
 
-Selected at startup based on `config.yaml` synthesis settings. Additional providers can be added by implementing `SynthesisProvider.analyze()`.
+## Chunking Strategies
+
+### Code (tree-sitter AST — Scala, Java, Python)
+
+| Chunk Type | What | Size |
+|---|---|---|
+| method/function | Full method body | Split at ~512 tokens if long |
+| class summary | Class name + all method signatures | Table of contents |
+| import block | All imports per file | One chunk per file |
+
+Metadata: `file_path`, `language`, `chunk_type`, `qualified_name`, `signature`, `spark_apis` (JSON), `problem_indicators` (JSON).
+
+### Docs (beautifulsoup4 — HTML from spark.apache.org)
+
+| Chunk Type | Split Strategy |
+|---|---|
+| prose section | Split on heading boundaries, keep heading hierarchy |
+| code example | Separate chunk, linked to parent section |
+| config table | Separate chunk, key-value pairs |
+
+Metadata: `doc_url`, `doc_section`, `heading_hierarchy`, `content_type`, `related_configs`.
+
+### StackOverflow (API JSON + beautifulsoup4)
+
+| Chunk Type | What |
+|---|---|
+| question | Title + body |
+| answer | Each answer separately |
+
+Filter: only questions with accepted answer OR answer score > 0.
+
+Metadata: `question_id`, `score`, `is_accepted`, `tags`, `error_type`, `spark_apis_mentioned`, `spark_versions_mentioned`.
+
+### GitHub Issues (GitHub API)
+
+| Chunk Type | What |
+|---|---|
+| issue | Title + body |
+| comment | Each comment, linked to parent issue |
+
+All states: open + closed. Comments included.
+
+Metadata: `issue_number`, `state`, `labels`, `author`, `is_comment`, `parent_issue_number`, `created_at`, `closed_at`, `spark_versions_mentioned`, `linked_prs`.
+
+---
+
+## Phase 2: LlamaIndex Migration
+
+Phase 1 (current) uses custom code with direct pymilvus, tree-sitter, and beautifulsoup4 for full control and learning.
+
+Phase 2 replaces the custom plumbing with LlamaIndex, which is purpose-built for RAG pipelines:
+
+| Component | Phase 1 (Custom) | Phase 2 (LlamaIndex) |
+|---|---|---|
+| Code chunking | Custom tree-sitter parser | `CodeSplitter` (tree-sitter under the hood) |
+| Doc/SO/Issue chunking | Custom beautifulsoup4 | Custom `NodeParser` subclasses |
+| Embedding client | Direct Ollama HTTP calls | `OllamaEmbedding` |
+| Milvus operations | Direct pymilvus | `MilvusVectorStore` |
+| Multi-collection search | Custom parallel search + merge | `QueryFusionRetriever` with reciprocal rank fusion |
+| Re-ranking | Custom scoring logic | `NodePostprocessor` subclass |
+| Incremental sync | Custom high-water mark | `IngestionPipeline` with built-in hash-based dedup |
+| Claude synthesis | Direct anthropic SDK | `Anthropic` LLM + `ResponseSynthesizer` |
+
+### Why LlamaIndex for Phase 2
+
+- `CodeSplitter` already does tree-sitter AST-aware splitting — saves ~300 lines of custom code
+- `IngestionPipeline` has built-in deduplication (content hash) — exactly what the SO/issues incremental sync needs
+- `MilvusVectorStore` exposes more of Milvus's metadata filtering than LangChain's wrapper
+- `QueryFusionRetriever` handles multi-retriever fusion with reciprocal rank — replaces custom re-ranker
+- `NodePostprocessor` is a clean interface for custom scoring adjustments
+- Designed for RAG from the ground up (vs LangChain which is more general-purpose)
+
+### Migration Path
+
+Phase 1 code stays as the reference implementation. Phase 2 is a parallel implementation that:
+1. Reuses the same Milvus collections (schema unchanged)
+2. Reuses the same config.yaml and synthesis module
+3. Replaces `src/spark_rag/chunking/`, `embedding/`, `milvus/`, `ingestion/` internals with LlamaIndex equivalents
+4. API layer (`FastAPI`) stays — only the pipeline behind it changes
+
+The test suite validates both phases against the same expected behavior.
