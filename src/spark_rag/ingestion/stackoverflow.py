@@ -1,4 +1,4 @@
-"""StackOverflow ingestion — fetch answered Spark questions via API.
+"""StackOverflow ingestion — fetch answered Spark questions via API → Lance.
 
 Can be run standalone or called from an Airflow DAG.
 
@@ -16,13 +16,10 @@ from datetime import datetime
 
 import requests
 
-from pymilvus import MilvusClient
-
 from spark_rag.chunking.so_chunker import chunk_question
 from spark_rag.config import load_config
-from spark_rag.embedding.client import EmbeddingClient
-from spark_rag.milvus.collections import create_collection
-from spark_rag.milvus.ingest import ingest_incremental_so
+from spark_rag.lance.schemas import so_chunks_to_table
+from spark_rag.lance.store import LanceStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -96,10 +93,9 @@ def fetch_questions(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest StackOverflow Spark Q&A into Milvus")
+    parser = argparse.ArgumentParser(description="Ingest StackOverflow Spark Q&A into Lance")
     parser.add_argument("--since", help="Fetch questions modified after this date (YYYY-MM-DD)")
     parser.add_argument("--max", type=int, default=None, help="Override max_questions from config")
-    parser.add_argument("--batch-size", type=int, default=200)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -112,53 +108,35 @@ def main():
     questions = fetch_questions(so_cfg.tags, max_questions=max_q, since=since)
 
     # Chunk
-    data_by_question: dict[int, list[dict]] = {}
-    total_chunks = 0
+    all_chunks = []
+    chunks_by_question: dict[int, list] = {}
     for q in questions:
         chunks = chunk_question(q)
-        total_chunks += len(chunks)
-        data_by_question[q["question_id"]] = []
-        for chunk in chunks:
-            data_by_question[q["question_id"]].append(
-                # Store without embedding for now — will embed below
-                {"_chunk": chunk}
-            )
+        all_chunks.extend(chunks)
+        chunks_by_question[q["question_id"]] = chunks
 
-    logger.info("Chunked %d questions → %d chunks", len(questions), total_chunks)
+    logger.info("Chunked %d questions → %d chunks", len(questions), len(all_chunks))
 
     if args.dry_run:
-        logger.info("DRY RUN — not embedding or inserting")
+        logger.info("DRY RUN — not writing to Lance")
         return
 
-    # Embed all chunks
-    embedding_client = EmbeddingClient(cfg.ollama)
-    all_chunks = []
-    for qid, chunk_wrappers in data_by_question.items():
-        for cw in chunk_wrappers:
-            all_chunks.append(cw["_chunk"])
+    # Write to Lance (incremental by question_id)
+    store = LanceStore(cfg.lance, cfg.polaris)
+    total = 0
+    for qid, chunks in chunks_by_question.items():
+        table = so_chunks_to_table(chunks)
+        total += store.replace_by_id("spark_so", "question_id", qid, table)
 
-    texts = [c.content for c in all_chunks]
-    embed_result = embedding_client.embed_batch(texts, batch_size=args.batch_size)
+    # Register table in Polaris (once after all inserts)
+    if total > 0:
+        from spark_rag.lance.polaris_helpers import register_table
+        register_table(
+            cfg.polaris.endpoint, store.token, cfg.polaris.catalog,
+            cfg.polaris.namespace, "spark_so", store._uri("spark_so"),
+        )
 
-    # Rebuild data_by_question with embeddings
-    idx = 0
-    embedded_by_question: dict[int, list[dict]] = {}
-    for qid, chunk_wrappers in data_by_question.items():
-        embedded_by_question[qid] = []
-        for cw in chunk_wrappers:
-            chunk = cw["_chunk"]
-            embedded_by_question[qid].append(
-                chunk.to_milvus_data(embed_result.vectors[idx])
-            )
-            idx += 1
-
-    # Insert
-    milvus_client = MilvusClient(uri=cfg.milvus.url)
-    create_collection(milvus_client, "spark_stackoverflow", drop_existing=False)
-
-    count = ingest_incremental_so(milvus_client, embedded_by_question, batch_size=args.batch_size)
-    logger.info("Ingested %d SO records", count)
-    milvus_client.close()
+    logger.info("Wrote %d SO chunks to Lance", total)
 
 
 if __name__ == "__main__":

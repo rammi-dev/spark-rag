@@ -16,13 +16,10 @@ from datetime import datetime
 
 import requests
 
-from pymilvus import MilvusClient
-
 from spark_rag.chunking.issue_chunker import chunk_issue
 from spark_rag.config import load_config
-from spark_rag.embedding.client import EmbeddingClient
-from spark_rag.milvus.collections import create_collection
-from spark_rag.milvus.ingest import ingest_incremental_issues
+from spark_rag.lance.schemas import issue_chunks_to_table
+from spark_rag.lance.store import LanceStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -149,10 +146,9 @@ def _check_rate_limit(headers: dict) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest GitHub issues into Milvus")
+    parser = argparse.ArgumentParser(description="Ingest GitHub issues into Lance")
     parser.add_argument("--since", help="Fetch issues updated after this date (YYYY-MM-DD)")
     parser.add_argument("--max", type=int, default=None, help="Override max_issues from config")
-    parser.add_argument("--batch-size", type=int, default=200)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--token", help="GitHub personal access token")
     args = parser.parse_args()
@@ -173,48 +169,35 @@ def main():
     )
 
     # Chunk
-    data_by_issue: dict[int, list] = {}
+    chunks_by_issue: dict[int, list] = {}
     total_chunks = 0
     for issue in issues:
         chunks = chunk_issue(issue)
         total_chunks += len(chunks)
-        data_by_issue[issue["number"]] = [{"_chunk": c} for c in chunks]
+        chunks_by_issue[issue["number"]] = chunks
 
     logger.info("Chunked %d issues → %d chunks", len(issues), total_chunks)
 
     if args.dry_run:
-        logger.info("DRY RUN — not embedding or inserting")
+        logger.info("DRY RUN — not writing to Lance")
         return
 
-    # Embed
-    embedding_client = EmbeddingClient(cfg.ollama)
-    all_chunks = []
-    for issue_num, chunk_wrappers in data_by_issue.items():
-        for cw in chunk_wrappers:
-            all_chunks.append(cw["_chunk"])
+    # Write to Lance (incremental by issue_number)
+    store = LanceStore(cfg.lance, cfg.polaris)
+    total = 0
+    for issue_num, chunks in chunks_by_issue.items():
+        table = issue_chunks_to_table(chunks)
+        total += store.replace_by_id("spark_issues", "issue_number", issue_num, table)
 
-    texts = [c.content for c in all_chunks]
-    embed_result = embedding_client.embed_batch(texts, batch_size=args.batch_size)
+    # Register table in Polaris (once after all inserts)
+    if total > 0:
+        from spark_rag.lance.polaris_helpers import register_table
+        register_table(
+            cfg.polaris.endpoint, store.token, cfg.polaris.catalog,
+            cfg.polaris.namespace, "spark_issues", store._uri("spark_issues"),
+        )
 
-    # Rebuild with embeddings
-    idx = 0
-    embedded_by_issue: dict[int, list[dict]] = {}
-    for issue_num, chunk_wrappers in data_by_issue.items():
-        embedded_by_issue[issue_num] = []
-        for cw in chunk_wrappers:
-            chunk = cw["_chunk"]
-            embedded_by_issue[issue_num].append(
-                chunk.to_milvus_data(embed_result.vectors[idx])
-            )
-            idx += 1
-
-    # Insert
-    milvus_client = MilvusClient(uri=cfg.milvus.url)
-    create_collection(milvus_client, "spark_issues", drop_existing=False)
-
-    count = ingest_incremental_issues(milvus_client, embedded_by_issue, batch_size=args.batch_size)
-    logger.info("Ingested %d issue records", count)
-    milvus_client.close()
+    logger.info("Wrote %d issue chunks to Lance", total)
 
 
 if __name__ == "__main__":

@@ -97,27 +97,12 @@ def main():
         _print_stats(all_chunks)
         return
 
-    # Embed
-    logger.info("Embedding %d chunks via Ollama (%s)...", len(all_chunks), cfg.ollama.embedding_model)
-    embedding_client = EmbeddingClient(cfg.ollama)
-    texts = [c.content for c in all_chunks]
-    embed_result = embedding_client.embed_batch(texts, batch_size=args.batch_size)
-    logger.info("Embedded %d chunks (dim=%d)", len(embed_result.vectors), embed_result.dimension)
-
-    # Build Milvus data
-    data = [
-        chunk.to_milvus_data(spark_version, embedding)
-        for chunk, embedding in zip(all_chunks, embed_result.vectors)
-    ]
-
-    # Insert into Milvus
-    milvus_client = MilvusClient(uri=cfg.milvus.url)
-    create_collection(milvus_client, "spark_docs", drop_existing=False)
-
-    count = ingest_version(milvus_client, "spark_docs", data, spark_version, batch_size=args.batch_size)
-    logger.info("Ingested %d records into spark_docs for version %s", count, spark_version)
-
-    milvus_client.close()
+    # Write to Lance
+    logger.info("Writing %d chunks to Lance table 'spark_docs'...", len(all_chunks))
+    table = doc_chunks_to_table(all_chunks, spark_version)
+    store = LanceStore(cfg.lance, cfg.polaris)
+    count = store.replace_version("spark_docs", spark_version, table)
+    logger.info("Wrote %d rows to Lance for version %s", count, spark_version)
 
 
 def _print_stats(chunks):
