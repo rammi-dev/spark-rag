@@ -1,4 +1,4 @@
-"""One-time ingestion: Spark documentation (Markdown) → Milvus.
+"""One-time ingestion: Spark documentation (Markdown) → Lance.
 
 Reads docs/*.md from the same git clone used for code ingestion.
 Resolves {% include_example %} tags from examples/src/main/.
@@ -14,14 +14,11 @@ import logging
 import sys
 from pathlib import Path
 
-from pymilvus import MilvusClient
-
 from spark_rag.chunking.doc_chunker import chunk_markdown
 from spark_rag.config import load_config
-from spark_rag.embedding.client import EmbeddingClient
 from spark_rag.ingestion.github import checkout_version, ensure_repo
-from spark_rag.milvus.collections import create_collection
-from spark_rag.milvus.ingest import ingest_version
+from spark_rag.lance.schemas import doc_chunks_to_table
+from spark_rag.lance.store import LanceStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -49,10 +46,9 @@ def _build_examples_lookup(repo_dir: Path, examples_path: str) -> dict[str, str]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest Spark documentation into Milvus")
+    parser = argparse.ArgumentParser(description="Ingest Spark documentation into Lance")
     parser.add_argument("--version", required=True, help="Spark version (e.g. 4.1.0)")
-    parser.add_argument("--batch-size", type=int, default=200, help="Embedding/insert batch size")
-    parser.add_argument("--dry-run", action="store_true", help="Chunk and count without embedding/inserting")
+    parser.add_argument("--dry-run", action="store_true", help="Chunk and count without writing to Lance")
     args = parser.parse_args()
 
     cfg = load_config()

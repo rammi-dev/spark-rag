@@ -1,8 +1,8 @@
-"""One-time ingestion: Spark source code → Milvus.
+"""One-time ingestion: Spark source code → Lance.
 
 Usage:
     uv run python -m spark_rag.ingestion.code --version 4.1.0
-    uv run python -m spark_rag.ingestion.code --version 3.5.4 --batch-size 100
+    uv run python -m spark_rag.ingestion.code --version 3.5.4 --dry-run
 """
 
 from __future__ import annotations
@@ -11,24 +11,20 @@ import argparse
 import logging
 import sys
 
-from pymilvus import MilvusClient
-
 from spark_rag.chunking.code_chunker import chunk_file, detect_language
 from spark_rag.config import load_config
-from spark_rag.embedding.client import EmbeddingClient
 from spark_rag.ingestion.github import checkout_version, ensure_repo, iter_files
-from spark_rag.milvus.collections import create_collection
-from spark_rag.milvus.ingest import ingest_version
+from spark_rag.lance.schemas import code_chunks_to_table
+from spark_rag.lance.store import LanceStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest Spark source code into Milvus")
+    parser = argparse.ArgumentParser(description="Ingest Spark source code into Lance")
     parser.add_argument("--version", required=True, help="Spark version (e.g. 4.1.0)")
-    parser.add_argument("--batch-size", type=int, default=200, help="Embedding/insert batch size")
-    parser.add_argument("--dry-run", action="store_true", help="Chunk and count without embedding/inserting")
+    parser.add_argument("--dry-run", action="store_true", help="Chunk and count without writing to Lance")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -72,27 +68,12 @@ def main():
         _print_stats(all_chunks)
         return
 
-    # Embed
-    logger.info("Embedding %d chunks via Ollama (%s)...", len(all_chunks), cfg.ollama.embedding_model)
-    embedding_client = EmbeddingClient(cfg.ollama)
-    texts = [c.content for c in all_chunks]
-    embed_result = embedding_client.embed_batch(texts, batch_size=args.batch_size)
-    logger.info("Embedded %d chunks (dim=%d)", len(embed_result.vectors), embed_result.dimension)
-
-    # Build Milvus data
-    data = [
-        chunk.to_milvus_data(spark_version, embedding)
-        for chunk, embedding in zip(all_chunks, embed_result.vectors)
-    ]
-
-    # Insert into Milvus
-    milvus_client = MilvusClient(uri=cfg.milvus.url)
-    create_collection(milvus_client, "spark_code", drop_existing=False)
-
-    count = ingest_version(milvus_client, "spark_code", data, spark_version, batch_size=args.batch_size)
-    logger.info("Ingested %d records into spark_code for version %s", count, spark_version)
-
-    milvus_client.close()
+    # Write to Lance
+    logger.info("Writing %d chunks to Lance table 'spark_code'...", len(all_chunks))
+    table = code_chunks_to_table(all_chunks, spark_version)
+    store = LanceStore(cfg.lance, cfg.polaris)
+    count = store.replace_version("spark_code", spark_version, table)
+    logger.info("Wrote %d rows to Lance for version %s", count, spark_version)
 
 
 def _print_stats(chunks):
