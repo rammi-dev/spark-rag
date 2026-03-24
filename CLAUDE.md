@@ -1,6 +1,10 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Source Layout
+
+`src/` layout (hatchling build backend). Application code lives in `src/spark_rag/`, not top-level. No linting or formatting tools configured (no ruff, mypy, black, or pre-commit hooks).
 
 ## Project Overview
 
@@ -49,6 +53,14 @@ uv run pytest                              # all tests (162 unit + 21 integratio
 uv run pytest tests/unit/                  # unit only (no infra needed)
 uv run pytest tests/infra/                 # Milvus + Airflow + Ollama validation
 uv run pytest tests/integration/           # needs Ollama + Milvus port-forwarded
+
+# Single test file or function
+uv run pytest tests/unit/test_config.py              # single file
+uv run pytest tests/unit/test_config.py::test_name   # single test
+uv run pytest -k "pattern"                            # by name pattern
+
+# Custom Milvus URI for integration/infra tests
+uv run pytest tests/integration/ --milvus-uri http://custom:19530
 ```
 
 ### Port-forwarding (for local dev)
@@ -130,3 +142,8 @@ api/
 - DAGs PVC mounted on **dag-processor** pod, not the scheduler
 - Deploy DAGs via dag-processor: `kubectl exec -n airflow <dag-processor-pod> -c dag-processor -- ...`
 - Airflow 3.x API uses JWT auth: `POST /auth/token` with admin:admin
+
+## Design Docs
+
+- `docs/architecture.md` — system architecture and data flow
+- `docs/milvus-collections.md` — collection schemas and indexing details

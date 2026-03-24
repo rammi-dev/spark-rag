@@ -12,6 +12,22 @@ synthesis:
   provider: "claude"
   model: "claude-sonnet-4-20250514"
 
+# Lance artifact store on Ceph S3
+lance:
+  s3_endpoint: "http://localhost:8080"    # port-forwarded, or rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:8080
+  s3_bucket: "spark-rag"
+  s3_prefix: "lance"                      # datasets at s3://spark-rag/lance/<dataset>/
+  s3_access_key_env: "CEPH_ACCESS_KEY"    # env var names (not values)
+  s3_secret_key_env: "CEPH_SECRET_KEY"
+
+# Embedding experiments — column-per-model in Lance
+embedding_experiments:
+  models:
+    - name: "nomic-embed-text"
+      column: "emb_nomic"
+      dimensions: 768
+  active: "emb_nomic"                     # default column loaded into Milvus
+
 # Spark versions to index
 # Code + docs are ingested per version; all chunks tagged with spark_version metadata
 # Queries can filter by version or search across all

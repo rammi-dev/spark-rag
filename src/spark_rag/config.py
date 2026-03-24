@@ -78,6 +78,54 @@ class GitHubIssuesIngestion:
 
 
 @dataclass
+class LanceConfig:
+    s3_endpoint: str = "http://localhost:8080"
+    s3_bucket: str = "spark-rag"
+    s3_prefix: str = "lance"
+    s3_access_key_env: str = "CEPH_ACCESS_KEY"
+    s3_secret_key_env: str = "CEPH_SECRET_KEY"
+    s3_region: str = "us-east-1"
+
+    @property
+    def s3_access_key(self) -> str:
+        return os.environ.get(self.s3_access_key_env, "")
+
+    @property
+    def s3_secret_key(self) -> str:
+        return os.environ.get(self.s3_secret_key_env, "")
+
+    @property
+    def storage_options(self) -> dict[str, str]:
+        return {
+            "aws_endpoint": self.s3_endpoint,
+            "aws_access_key_id": self.s3_access_key,
+            "aws_secret_access_key": self.s3_secret_key,
+            "aws_region": self.s3_region,
+            "allow_http": "true",
+            "aws_virtual_hosted_style_request": "false",
+        }
+
+
+@dataclass
+class EmbeddingModelConfig:
+    name: str = "nomic-embed-text"
+    column: str = "emb_nomic"
+    dimensions: int = 768
+
+
+@dataclass
+class EmbeddingExperimentsConfig:
+    models: list[EmbeddingModelConfig] = field(default_factory=lambda: [EmbeddingModelConfig()])
+    active: str = "emb_nomic"
+
+    def get_model(self, column: str) -> EmbeddingModelConfig | None:
+        for m in self.models:
+            if m.column == column:
+                return m
+        return None
+
+
+@dataclass
 class IngestionConfig:
     spark_code: SparkCodeIngestion = field(default_factory=SparkCodeIngestion)
     spark_docs: SparkDocsIngestion = field(default_factory=SparkDocsIngestion)
@@ -92,6 +140,8 @@ class Config:
     synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
     spark_versions: SparkVersionsConfig = field(default_factory=SparkVersionsConfig)
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
+    lance: LanceConfig = field(default_factory=LanceConfig)
+    embedding_experiments: EmbeddingExperimentsConfig = field(default_factory=EmbeddingExperimentsConfig)
 
 
 def _apply_env_overrides(cfg: Config) -> None:
@@ -106,6 +156,10 @@ def _apply_env_overrides(cfg: Config) -> None:
         cfg.synthesis.enabled = True
     if model := os.environ.get("SYNTHESIS_MODEL"):
         cfg.synthesis.model = model
+    if url := os.environ.get("LANCE_S3_ENDPOINT"):
+        cfg.lance.s3_endpoint = url
+    if bucket := os.environ.get("LANCE_S3_BUCKET"):
+        cfg.lance.s3_bucket = bucket
 
 
 def load_config(path: Path | str | None = None) -> Config:
@@ -132,6 +186,8 @@ def load_config(path: Path | str | None = None) -> Config:
     synthesis_raw = raw.get("synthesis", {})
     versions_raw = raw.get("spark_versions", {})
     ingestion_raw = raw.get("ingestion", {})
+    lance_raw = raw.get("lance", {})
+    emb_exp_raw = raw.get("embedding_experiments", {})
 
     cfg = Config(
         ollama=OllamaConfig(
@@ -175,6 +231,23 @@ def load_config(path: Path | str | None = None) -> Config:
                 max_issues=ingestion_raw.get("github_issues", {}).get("max_issues", 10000),
             ) if "github_issues" in ingestion_raw else GitHubIssuesIngestion(),
         ),
+        lance=LanceConfig(
+            s3_endpoint=lance_raw.get("s3_endpoint", LanceConfig.s3_endpoint),
+            s3_bucket=lance_raw.get("s3_bucket", LanceConfig.s3_bucket),
+            s3_prefix=lance_raw.get("s3_prefix", LanceConfig.s3_prefix),
+            s3_access_key_env=lance_raw.get("s3_access_key_env", LanceConfig.s3_access_key_env),
+            s3_secret_key_env=lance_raw.get("s3_secret_key_env", LanceConfig.s3_secret_key_env),
+            s3_region=lance_raw.get("s3_region", LanceConfig.s3_region),
+        ) if lance_raw else LanceConfig(),
+        embedding_experiments=EmbeddingExperimentsConfig(
+            models=[
+                EmbeddingModelConfig(
+                    name=m["name"], column=m["column"], dimensions=m["dimensions"],
+                )
+                for m in emb_exp_raw.get("models", [])
+            ] if emb_exp_raw.get("models") else [EmbeddingModelConfig()],
+            active=emb_exp_raw.get("active", "emb_nomic"),
+        ) if emb_exp_raw else EmbeddingExperimentsConfig(),
     )
 
     _apply_env_overrides(cfg)
