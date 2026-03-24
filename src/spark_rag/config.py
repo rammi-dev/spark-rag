@@ -78,6 +78,19 @@ class GitHubIssuesIngestion:
 
 
 @dataclass
+class PolarisConfig:
+    endpoint: str = "http://localhost:8181"
+    catalog: str = "spark_rag_catalog"
+    namespace: str = "spark_rag"
+    client_id: str = "root"
+    client_secret_env: str = "POLARIS_CLIENT_SECRET"
+
+    @property
+    def client_secret(self) -> str:
+        return os.environ.get(self.client_secret_env, "")
+
+
+@dataclass
 class LanceConfig:
     s3_endpoint: str = "http://localhost:8080"
     s3_bucket: str = "spark-rag"
@@ -140,6 +153,7 @@ class Config:
     synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
     spark_versions: SparkVersionsConfig = field(default_factory=SparkVersionsConfig)
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
+    polaris: PolarisConfig = field(default_factory=PolarisConfig)
     lance: LanceConfig = field(default_factory=LanceConfig)
     embedding_experiments: EmbeddingExperimentsConfig = field(default_factory=EmbeddingExperimentsConfig)
 
@@ -156,6 +170,8 @@ def _apply_env_overrides(cfg: Config) -> None:
         cfg.synthesis.enabled = True
     if model := os.environ.get("SYNTHESIS_MODEL"):
         cfg.synthesis.model = model
+    if url := os.environ.get("POLARIS_ENDPOINT"):
+        cfg.polaris.endpoint = url
     if url := os.environ.get("LANCE_S3_ENDPOINT"):
         cfg.lance.s3_endpoint = url
     if bucket := os.environ.get("LANCE_S3_BUCKET"):
@@ -186,6 +202,7 @@ def load_config(path: Path | str | None = None) -> Config:
     synthesis_raw = raw.get("synthesis", {})
     versions_raw = raw.get("spark_versions", {})
     ingestion_raw = raw.get("ingestion", {})
+    polaris_raw = raw.get("polaris", {})
     lance_raw = raw.get("lance", {})
     emb_exp_raw = raw.get("embedding_experiments", {})
 
@@ -231,6 +248,13 @@ def load_config(path: Path | str | None = None) -> Config:
                 max_issues=ingestion_raw.get("github_issues", {}).get("max_issues", 10000),
             ) if "github_issues" in ingestion_raw else GitHubIssuesIngestion(),
         ),
+        polaris=PolarisConfig(
+            endpoint=polaris_raw.get("endpoint", PolarisConfig.endpoint),
+            catalog=polaris_raw.get("catalog", PolarisConfig.catalog),
+            namespace=polaris_raw.get("namespace", PolarisConfig.namespace),
+            client_id=polaris_raw.get("client_id", PolarisConfig.client_id),
+            client_secret_env=polaris_raw.get("client_secret_env", PolarisConfig.client_secret_env),
+        ) if polaris_raw else PolarisConfig(),
         lance=LanceConfig(
             s3_endpoint=lance_raw.get("s3_endpoint", LanceConfig.s3_endpoint),
             s3_bucket=lance_raw.get("s3_bucket", LanceConfig.s3_bucket),

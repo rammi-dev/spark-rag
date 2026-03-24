@@ -12,11 +12,19 @@ synthesis:
   provider: "claude"
   model: "claude-sonnet-4-20250514"
 
+# Apache Polaris catalog (metadata for Lance tables)
+polaris:
+  endpoint: "http://localhost:8181"       # port-forwarded, or polaris.polaris.svc:8181 in-cluster
+  catalog: "spark_rag_catalog"
+  namespace: "spark_rag"
+  client_id: "root"
+  client_secret_env: "POLARIS_CLIENT_SECRET"  # env var name (not the value)
+
 # Lance artifact store on Ceph S3
 lance:
   s3_endpoint: "http://localhost:8080"    # port-forwarded, or rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:8080
   s3_bucket: "spark-rag"
-  s3_prefix: "lance"                      # datasets at s3://spark-rag/lance/<dataset>/
+  s3_prefix: "lance"                      # datasets at s3://spark-rag/lance/<table>/
   s3_access_key_env: "CEPH_ACCESS_KEY"    # env var names (not values)
   s3_secret_key_env: "CEPH_SECRET_KEY"
 
